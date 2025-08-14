@@ -34,7 +34,7 @@ const SUMMARY_FILE = OUTPUT_DIR . "/summary.json";
 const CONFIGS_FOR_MAIN_AGGREGATE = 15;
 const CONFIGS_FOR_CHANNEL_SUBS = 40;
 
-const PRIVATE_CONFIGS_URL = "https://raw.githubusercontent.com/itsyebekhe/PSGP/main/private_configs.json";
+const PRIVATE_CONFIGS_URL = "https://raw.githubusercontent.com/yasi-python/PSGP/main/private_configs.json";
 
 /**
  * Processes a single raw config string and enriches it with metadata.
@@ -298,7 +298,7 @@ arsort($countryDistribution);
 $summaryData = [
     'meta' => [
         'last_updated' => date('c'), // ISO 8601 format
-        'author' => 'itsyebekhe/PSG',
+        'author' => 'yasi-python/PSG',
     ],
     'sources' => [
         'total_from_assets' => $originalSourceCount,
