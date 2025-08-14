@@ -232,7 +232,7 @@ function generate_profile(string $base64_configs, array $base_structure, string 
 //profile-update-interval: 1
 //subscription-userinfo: upload=0; download=0; total=10737418240000000; expire=2546249531
 //support-url: https://t.me/yebekhe
-//profile-web-page-url: ithub.com/itsyebekhe/PSG
+//profile-web-page-url: ithub.com/yasi-python/PSG
 
 HEADER;
         $final_output .= $header;
