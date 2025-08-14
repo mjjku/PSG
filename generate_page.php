@@ -14,7 +14,7 @@ declare(strict_types=1);
 define("PROJECT_ROOT", __DIR__);
 define(
     "GITHUB_REPO_URL",
-    "https://raw.githubusercontent.com/itsyebekhe/PSG/main"
+    "https://raw.githubusercontent.com/yasi-python/PSG/main"
 );
 define("OUTPUT_HTML_FILE", PROJECT_ROOT . "/index.html");
 define("SCAN_DIRECTORIES", [
@@ -1773,7 +1773,7 @@ async function handleShare(contentToUpload, buttonElement) {
         }
 
         async function generateClashOutput(nodes) {
-            const templateURL = 'https://raw.githubusercontent.com/itsyebekhe/PSG/main/templates/clash.yaml';
+            const templateURL = 'https://raw.githubusercontent.com/yasi-python/PSG/main/templates/clash.yaml';
             const response = await fetch(templateURL);
             if (!response.ok) throw new Error('Could not fetch Clash template.');
             let templateContent = await response.text();
@@ -1809,7 +1809,7 @@ async function handleShare(contentToUpload, buttonElement) {
         }
         
         async function generateSingboxOutput(nodes) {
-            const templateURL = 'https://raw.githubusercontent.com/itsyebekhe/PSG/main/templates/structure.json';
+            const templateURL = 'https://raw.githubusercontent.com/yasi-python/PSG/main/templates/structure.json';
             const response = await fetch(templateURL);
             if (!response.ok) throw new Error('Could not fetch Sing-box template.');
             const templateString = await response.text();
