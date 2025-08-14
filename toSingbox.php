@@ -287,7 +287,11 @@ foreach (CONVERSION_TASKS as $task_name => $task_config) {
         
         echo "  -> Processing {$filename} for {$task_name}..." . PHP_EOL;
 
-        $base64_data = file_get_contents($filepath);
+    $base64_data = file_get_contents($filepath);
+
+    // NEW: Run precheck on base64 data to remove timed-out configs before conversion
+    require_once __DIR__ . '/scripts/precheck.php';
+    $base64_data = precheck_base64_string($base64_data, ['timeout' => 3, 'ports' => [443,80,53]]);
 
         // We need a fresh copy of the structure for each file, so we re-assign it.
         $structure_for_this_file = $base_structure;

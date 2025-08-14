@@ -155,6 +155,18 @@ echo "3. Writing subscription files..." . PHP_EOL;
 // NEW: Generate the list of fake config strings that will be appended to every file
 $fakeConfigs = array_map('create_fake_config', FAKE_CONFIG_NAMES);
 
+// NEW: Precheck - filter out configs that timeout before producing final files
+require_once __DIR__ . '/scripts/precheck.php';
+
+echo "4. Prechecking configs for timeouts (this may take some time)..." . PHP_EOL;
+foreach ($sortedConfigs as $type => $addressGroups) {
+    foreach ($addressGroups as $addressType => $configs) {
+        $passed = precheck_config_list($configs, ['timeout' => 3, 'ports' => [443,80,53]]);
+        // replace with passed-only
+        $sortedConfigs[$type][$addressType] = $passed;
+    }
+}
+
 if (!is_dir(SUBS_DIR_NORMAL)) {
     mkdir(SUBS_DIR_NORMAL, 0775, true);
 }
