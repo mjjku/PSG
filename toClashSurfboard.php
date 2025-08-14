@@ -15,7 +15,7 @@ if (!class_exists('ConfigWrapper')) { die('Error: ConfigWrapper class not found 
 const INPUT_DIR = __DIR__ . '/subscriptions/xray/base64';
 const OUTPUT_DIR_BASE = __DIR__ . '/subscriptions';
 const TEMPLATES_DIR = __DIR__ . '/templates';
-const GITHUB_BASE_URL = 'https://raw.githubusercontent.com/itsyebekhe/PSG/main';
+const GITHUB_BASE_URL = 'https://raw.githubusercontent.com/yasi-python/PSG/main';
 
 const ALLOWED_SS_METHODS = ["chacha20-ietf-poly1305", "aes-256-gcm"];
 // Define which input files can be converted to which output formats
