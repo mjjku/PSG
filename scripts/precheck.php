@@ -12,6 +12,12 @@ require_once __DIR__ . '/../functions.php';
  * Designed to be conservative and rate-limited to reduce ban risk.
  */
 
+// Safe mode: when SKIP_NETWORK_PROBES is set to "1" in the environment (useful for
+// running on GitHub Actions or other CI systems), the precheck functions will
+// skip any external network probes and return the input configs after basic
+// trimming. This avoids running active network scans from ephemeral runners.
+define('SKIP_NETWORK_PROBES', getenv('SKIP_NETWORK_PROBES') === '1');
+
 function find_executable(string $name): ?string
 {
     $which = trim((string)shell_exec('which ' . escapeshellarg($name) . ' 2>/dev/null'));
@@ -106,6 +112,13 @@ function extract_host_port_from_config(string $config): array
  */
 function precheck_config_list(array $configs, array $options = []): array
 {
+    if (SKIP_NETWORK_PROBES) {
+        // Minimal sanitization in safe mode: trim and remove empty lines.
+        echo "[SAFE-MODE] SKIP_NETWORK_PROBES=1 — skipping network probes\n";
+        $trimmed = array_values(array_filter(array_map('trim', $configs), fn($v) => $v !== ''));
+        return $trimmed;
+    }
+
     $timeout = $options['timeout'] ?? 3;
     $portsFallback = $options['ports'] ?? [443, 80, 53];
     $minDelay = $options['min_delay'] ?? 0.5;
