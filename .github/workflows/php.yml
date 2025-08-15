@@ -1,22 +1,32 @@
-name: "Proxy Subscription Generator (PSG)"
+name: "Proxy Subscription Generator (PSG) — Proxy-aware"
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 * * * *' # Run every hour exactly
-
-concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: true
+    - cron: '7 * * * *'
 
 permissions:
   contents: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TZ: 'Asia/Tehran'
+  JITTER_MAX_SECONDS: '120'
+  MAX_ATTEMPTS: '4'
+  DEFAULT_TIMEOUT_SECONDS: '900'
+  LARGE_TIMEOUT_SECONDS: '3600'
+  CONTINUE_ON_FAIL: '1'
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+
     steps:
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -29,55 +39,136 @@ jobs:
           extensions: mbstring, curl, sockets
           tools: composer
 
-      - name: Patch precheck.php for PHP 8 compatibility
+      - name: Export optional proxy env (if provided in secrets)
+        # This step exports http(s)_proxy env vars for subprocesses (PHP/cURL respects these too).
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL || '' }}
+          PROXY_USER: ${{ secrets.PROXY_USER || '' }}
+          PROXY_PASS: ${{ secrets.PROXY_PASS || '' }}
         run: |
-          if [ -f "scripts/precheck.php" ]; then
-            sed -i 's/stream_set_blocking(\([^,]*\), *0)/stream_set_blocking(\1, false)/g' scripts/precheck.php
-            sed -i 's/stream_set_blocking(\([^,]*\), *1)/stream_set_blocking(\1, true)/g' scripts/precheck.php
-            echo "✅ Patch applied to scripts/precheck.php"
+          if [ -n "${PROXY_URL:-}" ]; then
+            echo "Proxy configured. Exporting proxy environment variables."
+            # If PROXY_USER/PASS provided, build authenticated proxy url
+            if [ -n "${PROXY_USER:-}" ] && [ -n "${PROXY_PASS:-}" ]; then
+              AUTH=$(python3 - <<'PY'
+import urllib.parse, os
+u=os.environ.get("PROXY_USER")
+p=os.environ.get("PROXY_PASS")
+print(urllib.parse.quote(u, safe='') + ':' + urllib.parse.quote(p, safe=''))
+PY
+)
+              export_proxy="http://${AUTH}@${PROXY_URL#http://}"
+            else
+              export_proxy="${PROXY_URL}"
+            fi
+            echo "http_proxy=${export_proxy}" >> $GITHUB_ENV
+            echo "https_proxy=${export_proxy}" >> $GITHUB_ENV
+            # also set lowercase (some tools look for lowercase)
+            echo "HTTP_PROXY=${export_proxy}" >> $GITHUB_ENV
+            echo "HTTPS_PROXY=${export_proxy}" >> $GITHUB_ENV
           else
-            echo "ℹ️ scripts/precheck.php not found, skipping patch."
+            echo "No PROXY_URL secret set — running without upstream proxy."
           fi
 
-      - name: Generate Full Subscriptions
+      - name: Preflight & patch PHP8
         run: |
-          set -e
-          echo "--- Starting Full PSG Generation ---"
-          php channelsAssets.php || { echo "❌ channelsAssets.php failed"; exit 1; }
-          php get.php || { echo "❌ get.php failed"; exit 1; }
-          php duplicate.php || { echo "❌ duplicate.php failed"; exit 1; }
-          php sort.php || { echo "❌ sort.php failed"; exit 1; }
-          php toSingbox.php || { echo "❌ toSingbox.php failed"; exit 1; }
-          php toClashSurfboard.php || { echo "❌ toClashSurfboard.php failed"; exit 1; }
-          php hiddifyWarp.php || { echo "❌ hiddifyWarp.php failed"; exit 1; }
-          echo "--- ✅ Full Generation Complete ---"
+          set -Eeuo pipefail
+          php -v
+          if [ -f scripts/precheck.php ]; then
+            sed -i 's/stream_set_blocking(\([^,]*\), *0)/stream_set_blocking(\1, false)/g' scripts/precheck.php || true
+            sed -i 's/stream_set_blocking(\([^,]*\), *1)/stream_set_blocking(\1, true)/g' scripts/precheck.php || true
+          fi
 
-      - name: Generate Lite Subscriptions
+      - name: Create run wrapper
         run: |
-          set -e
-          echo "--- Starting Lite PSG Generation ---"
-          cd lite
-          php channelsAssets.php || { echo "❌ channelsAssets.php failed"; exit 1; }
-          php get.php || { echo "❌ get.php failed"; exit 1; }
-          php duplicate.php || { echo "❌ duplicate.php failed"; exit 1; }
-          php sort.php || { echo "❌ sort.php failed"; exit 1; }
-          php toSingbox.php || { echo "❌ toSingbox.php failed"; exit 1; }
-          php toClashSurfboard.php || { echo "❌ toClashSurfboard.php failed"; exit 1; }
-          echo "--- ✅ Lite Generation Complete ---"
+          mkdir -p .github/scripts .github/logs
+          cat > .github/scripts/run_php_retry.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+MAX_ATTEMPTS=${MAX_ATTEMPTS:-4}
+TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-900}
+CONTINUE_ON_FAIL=${CONTINUE_ON_FAIL:-1}
+SCRIPT="$1"; shift || true
+for i in $(seq 1 $MAX_ATTEMPTS); do
+  echo "Attempt $i/$MAX_ATTEMPTS: php $SCRIPT $*"
+  if timeout --foreground ${TIMEOUT_SECONDS}s php "$SCRIPT" "$@"; then
+    exit 0
+  fi
+  if [ "$i" -lt "$MAX_ATTEMPTS" ]; then
+    sleep $((5 * 2**(i-1) + RANDOM % 10))
+  fi
+done
+echo "ALL ATTEMPTS FAILED for $SCRIPT" | tee -a .github/logs/failed_steps.log
+if [ "${CONTINUE_ON_FAIL}" = "1" ]; then
+  exit 0
+fi
+exit 1
+EOF
+          chmod +x .github/scripts/run_php_retry.sh
 
-      - name: Generate HTML Index Page
-        run: |
-          set -e
-          echo "--- Generating HTML index page ---"
-          php generate_page.php || { echo "❌ generate_page.php failed"; exit 1; }
-          echo "--- ✅ HTML index page generated ---"
-
-      - name: Commit and Push Files
+      - name: Generate Full subscriptions (proxy-aware)
         env:
-          TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
+          MAX_ATTEMPTS: ${{ env.MAX_ATTEMPTS }}
+          CONTINUE_ON_FAIL: ${{ env.CONTINUE_ON_FAIL }}
+          TIMEOUT_SECONDS: ${{ env.LARGE_TIMEOUT_SECONDS }}
         run: |
-          git config --global user.name "GitHub Actions"
-          git config --global user.email "actions@github.com"
+          set -Eeuo pipefail
+          echo "--- Full ---"
+          ./.github/scripts/run_php_retry.sh channelsAssets.php
+          ./.github/scripts/run_php_retry.sh get.php
+          ./.github/scripts/run_php_retry.sh duplicate.php
+          ./.github/scripts/run_php_retry.sh sort.php
+          ./.github/scripts/run_php_retry.sh toSingbox.php
+          ./.github/scripts/run_php_retry.sh toClashSurfboard.php
+          if [ -f hiddifyWarp.php ]; then ./.github/scripts/run_php_retry.sh hiddifyWarp.php; fi
+          echo "--- Done ---"
+
+      - name: Generate Lite subscriptions (proxy-aware)
+        env:
+          MAX_ATTEMPTS: ${{ env.MAX_ATTEMPTS }}
+          CONTINUE_ON_FAIL: ${{ env.CONTINUE_ON_FAIL }}
+          TIMEOUT_SECONDS: ${{ env.DEFAULT_TIMEOUT_SECONDS }}
+        run: |
+          set -Eeuo pipefail
+          if [ -d lite ]; then
+            pushd lite
+            ../../.github/scripts/run_php_retry.sh channelsAssets.php
+            ../../.github/scripts/run_php_retry.sh get.php
+            ../../.github/scripts/run_php_retry.sh duplicate.php
+            ../../.github/scripts/run_php_retry.sh sort.php
+            ../../.github/scripts/run_php_retry.sh toSingbox.php
+            ../../.github/scripts/run_php_retry.sh toClashSurfboard.php
+            popd
+          fi
+
+      - name: Generate HTML
+        run: |
+          if [ -f generate_page.php ]; then php generate_page.php || true; fi
+
+      - name: Upload artifacts (always)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: psg-output-${{ github.run_id }}
+          path: |
+            .github/logs/**
+            index.html
+            lite/**
+          if-no-files-found: ignore
+
+      - name: Commit & push
+        env:
+          PUSH_TOKEN: ${{ secrets.PUSH_TOKEN || '' }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "🚀 Subscription Update | $(TZ='Asia/Tehran' date '+%Y-%m-%d %H:%M:%S')" || echo "ℹ️ No changes to commit."
-          git push https://x-access-token:${TOKEN}@github.com/${{ github.repository }} HEAD:${GITHUB_REF}
+          if git diff --cached --quiet; then echo "No changes to commit"; exit 0; fi
+          git commit -m "🚀 Subscription Update | $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          BRANCH=${GITHUB_REF##*/}
+          if [ -n "${PUSH_TOKEN:-}" ]; then
+            git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${{ github.repository }}.git
+          fi
+          git pull --rebase --autostash origin "$BRANCH" || true
+          git push origin HEAD:"$BRANCH"
