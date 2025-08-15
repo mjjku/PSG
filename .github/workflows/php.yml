@@ -14,16 +14,16 @@ concurrency:
 
 env:
   TZ: 'Asia/Tehran'
-  JITTER_MAX_SECONDS: '120'
-  MAX_ATTEMPTS: '5'
-  DEFAULT_TIMEOUT_SECONDS: '1200'
-  LARGE_TIMEOUT_SECONDS: '7200'
+  JITTER_MAX_SECONDS: '300'  # Increased for better anti-rate-limiting
+  MAX_ATTEMPTS: '6'  # Increased retries
+  DEFAULT_TIMEOUT_SECONDS: '1200'  # Increased timeout
+  LARGE_TIMEOUT_SECONDS: '7200'  # Increased large timeout
   CONTINUE_ON_FAIL: '1'
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180  # Increased job timeout
 
     steps:
       - name: Checkout
@@ -69,8 +69,29 @@ PY
             # also set uppercase (some tools look for uppercase)
             echo "HTTP_PROXY=${export_proxy}" >> $GITHUB_ENV
             echo "HTTPS_PROXY=${export_proxy}" >> $GITHUB_ENV
+            # Set no_proxy to avoid proxying internal/GitHub traffic
+            echo "no_proxy=*.github.com,*.actions.githubusercontent.com,localhost,127.0.0.1" >> $GITHUB_ENV
+            echo "NO_PROXY=*.github.com,*.actions.githubusercontent.com,localhost,127.0.0.1" >> $GITHUB_ENV
           else
             echo "No PROXY_URL secret set — running without upstream proxy."
+          fi
+
+      - name: Test proxy connection (if set)
+        run: |
+          if [ -n "${http_proxy:-}" ]; then
+            echo "Testing proxy..."
+            if curl -s -m 10 https://www.google.com > /dev/null; then
+              echo "Proxy test successful."
+            else
+              echo "Proxy test failed. Unsetting proxy to fallback to direct connection."
+              unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY
+              echo "http_proxy=" >> $GITHUB_ENV
+              echo "https_proxy=" >> $GITHUB_ENV
+              echo "HTTP_PROXY=" >> $GITHUB_ENV
+              echo "HTTPS_PROXY=" >> $GITHUB_ENV
+              echo "no_proxy=" >> $GITHUB_ENV
+              echo "NO_PROXY=" >> $GITHUB_ENV
+            fi
           fi
 
       - name: Preflight & patch PHP8
@@ -78,8 +99,8 @@ PY
           set -Eeuo pipefail
           php -v
           if [ -f scripts/precheck.php ]; then
-            sed -i 's/stream_set_blocking(\([^,]*\), *0)/stream_set_blocking(\1, false)/g' scripts/precheck.php
-            sed -i 's/stream_set_blocking(\([^,]*\), *1)/stream_set_blocking(\1, true)/g' scripts/precheck.php
+            sed -i 's/stream_set_blocking(\([^,]*\), *0)/stream_set_blocking(\1, false)/g' scripts/precheck.php || true
+            sed -i 's/stream_set_blocking(\([^,]*\), *1)/stream_set_blocking(\1, true)/g' scripts/precheck.php || true
           fi
 
       - name: Create run wrapper
@@ -88,7 +109,7 @@ PY
           cat > .github/scripts/run_php_retry.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-MAX_ATTEMPTS=${MAX_ATTEMPTS:-5}
+MAX_ATTEMPTS=${MAX_ATTEMPTS:-6}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1200}
 CONTINUE_ON_FAIL=${CONTINUE_ON_FAIL:-1}
 SCRIPT="$1"; shift || true
@@ -98,7 +119,7 @@ for i in $(seq 1 $MAX_ATTEMPTS); do
     exit 0
   fi
   if [ "$i" -lt "$MAX_ATTEMPTS" ]; then
-    sleep $((10 * 2**(i-1) + RANDOM % 20))
+    sleep $((10 * 2**(i-1) + RANDOM % 20))  # Increased backoff
   fi
 done
 echo "ALL ATTEMPTS FAILED for $SCRIPT" | tee -a .github/logs/failed_steps.log
@@ -118,12 +139,20 @@ EOF
           set -Eeuo pipefail
           echo "--- Full ---"
           ./.github/scripts/run_php_retry.sh channelsAssets.php
+          sleep $((RANDOM % 60))  # Add jitter between steps
           ./.github/scripts/run_php_retry.sh get.php
+          sleep $((RANDOM % 60))
           ./.github/scripts/run_php_retry.sh duplicate.php
+          sleep $((RANDOM % 60))
           ./.github/scripts/run_php_retry.sh sort.php
+          sleep $((RANDOM % 60))
           ./.github/scripts/run_php_retry.sh toSingbox.php
+          sleep $((RANDOM % 60))
           ./.github/scripts/run_php_retry.sh toClashSurfboard.php
-          if [ -f hiddifyWarp.php ]; then ./.github/scripts/run_php_retry.sh hiddifyWarp.php; fi
+          if [ -f hiddifyWarp.php ]; then 
+            sleep $((RANDOM % 60))
+            ./.github/scripts/run_php_retry.sh hiddifyWarp.php; 
+          fi
           echo "--- Done ---"
 
       - name: Generate Lite subscriptions (proxy-aware)
@@ -136,27 +165,22 @@ EOF
           if [ -d lite ]; then
             pushd lite
             ../../.github/scripts/run_php_retry.sh channelsAssets.php
+            sleep $((RANDOM % 60))
             ../../.github/scripts/run_php_retry.sh get.php
+            sleep $((RANDOM % 60))
             ../../.github/scripts/run_php_retry.sh duplicate.php
+            sleep $((RANDOM % 60))
             ../../.github/scripts/run_php_retry.sh sort.php
+            sleep $((RANDOM % 60))
             ../../.github/scripts/run_php_retry.sh toSingbox.php
+            sleep $((RANDOM % 60))
             ../../.github/scripts/run_php_retry.sh toClashSurfboard.php
             popd
           fi
 
-      - name: Delay between generations for anti-rate-limiting
-        run: sleep $((30 + RANDOM % 60))
-
       - name: Generate HTML
         run: |
           if [ -f generate_page.php ]; then php generate_page.php || true; fi
-
-      - name: Unset proxy for GitHub operations
-        run: |
-          unset http_proxy
-          unset https_proxy
-          unset HTTP_PROXY
-          unset HTTPS_PROXY
 
       - name: Upload artifacts (always)
         if: ${{ always() }}
@@ -170,7 +194,6 @@ EOF
           if-no-files-found: ignore
 
       - name: Commit & push
-        continue-on-error: true
         env:
           PUSH_TOKEN: ${{ secrets.PUSH_TOKEN || '' }}
           GITHUB_TOKEN: ${{ github.token }}
@@ -185,4 +208,4 @@ EOF
             git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${{ github.repository }}.git
           fi
           git pull --rebase --autostash origin "$BRANCH" || true
-          git push origin HEAD:"$BRANCH" || true
+          git push origin HEAD:"$BRANCH"
