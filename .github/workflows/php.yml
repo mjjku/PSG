@@ -3,29 +3,27 @@ name: "Proxy Subscription Generator (PSG)"
 on:
   workflow_dispatch:
   schedule:
-    - cron: '7 * * * *' # every hour at minute 7 (avoid top-of-hour spikes)
+    - cron: '7 * * * *' # every hour at minute 7 (avoids top-of-hour spikes)
 
 permissions:
   contents: write
 
-# Queue runs instead of cancelling the running one (avoids "Error: The operation was canceled.")
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  TZ: Asia/Tehran
-  JITTER_MAX_SECONDS: 120
-  MAX_ATTEMPTS: 4
-  DEFAULT_TIMEOUT_SECONDS: 900     # 15 minutes default per script
-  LARGE_TIMEOUT_SECONDS: 3600      # 1 hour for heavy scripts (get.php kind)
-  CONTINUE_ON_FAIL: "1"            # "1" = continue workflow when a script repeatedly fails (collect logs). Set to "0" for strict fail-fast.
-  PUSH_TOKEN: ${{ secrets.PUSH_TOKEN || '' }}  # optional personal token fallback
+  TZ: 'Asia/Tehran'
+  JITTER_MAX_SECONDS: '120'
+  MAX_ATTEMPTS: '4'
+  DEFAULT_TIMEOUT_SECONDS: '900'
+  LARGE_TIMEOUT_SECONDS: '3600'
+  CONTINUE_ON_FAIL: '1'
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 120  # increase job timeout to avoid runner cancellation
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repository
@@ -42,7 +40,7 @@ jobs:
           tools: composer
 
       - name: Composer cache
-        if: hashFiles('**/composer.lock') != ''
+        if: ${{ hashFiles('**/composer.lock') != '' }}
         uses: actions/cache@v4
         with:
           path: ~/.composer/cache
@@ -58,7 +56,7 @@ jobs:
 
       - name: Randomized start (anti-burst)
         run: |
-          s=$(( RANDOM % JITTER_MAX_SECONDS ))
+          s=$(( RANDOM % $JITTER_MAX_SECONDS ))
           echo "Sleeping $s seconds to avoid thundering herd"
           sleep "$s"
 
@@ -69,15 +67,11 @@ jobs:
           echo "::group::PHP extensions"
           php -m | grep -E '^(curl|mbstring|sockets)$' || true
           echo "::endgroup::"
-
-          # Fix stream_set_blocking(bool) patterns for PHP8+ (safe, idempotent)
           if [ -f "scripts/precheck.php" ]; then
             sed -i 's/stream_set_blocking(\([^,]*\), *0)/stream_set_blocking(\1, false)/g' scripts/precheck.php || true
             sed -i 's/stream_set_blocking(\([^,]*\), *1)/stream_set_blocking(\1, true)/g' scripts/precheck.php || true
             echo "Patched scripts/precheck.php for PHP8 bool args."
           fi
-
-          # Lightweight PHP lint for repo (skip vendor)
           if command -v find >/dev/null; then
             find . -type f -name '*.php' ! -path './vendor/*' -print0 | xargs -0 -I{} bash -c 'php -l "{}" || true'
           fi
@@ -116,34 +110,16 @@ EOF
           chmod +x .github/scripts/run_php_retry.sh
           echo "Wrapper script created: .github/scripts/run_php_retry.sh"
 
-      # OPTIONAL: best-effort add conservative cURL timeouts to common files (non-destructive)
-      - name: Best-effort: add conservative cURL timeouts (get.php / lite/get.php)
-        run: |
-          for f in get.php lite/get.php; do
-            if [ -f "$f" ]; then
-              if grep -q "curl_exec" "$f" && ! grep -q "CURLOPT_TIMEOUT" "$f"; then
-                echo "Patching $f: insert conservative curl timeouts before curl_exec"
-                awk '{
-                  if(match($0,/curl_exec[[:space:]]*\([^)]+\);/)) {
-                    print "curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);"
-                    print "curl_setopt($ch, CURLOPT_TIMEOUT, 30);"
-                    print "curl_setopt($ch, CURLOPT_FAILONERROR, true);"
-                  }
-                  print $0
-                }' "$f" > "$f.patched" && mv "$f.patched" "$f" || echo "Patch skipped for $f"
-              fi
-            fi
-          done
-
       - name: Generate Full subscriptions (resilient)
         env:
           MAX_ATTEMPTS: ${{ env.MAX_ATTEMPTS }}
           CONTINUE_ON_FAIL: ${{ env.CONTINUE_ON_FAIL }}
+          TIMEOUT_SECONDS: ${{ env.DEFAULT_TIMEOUT_SECONDS }}
         run: |
           set -Eeuo pipefail
           echo "--- Starting Full PSG Generation ---"
           ./.github/scripts/run_php_retry.sh channelsAssets.php
-          TIMEOUT_SECONDS=${{ env.LARGE_TIMEOUT_SECONDS }} ./.github/scripts/run_php_retry.sh get.php
+          ./.github/scripts/run_php_retry.sh get.php
           ./.github/scripts/run_php_retry.sh duplicate.php
           ./.github/scripts/run_php_retry.sh sort.php
           ./.github/scripts/run_php_retry.sh toSingbox.php
@@ -157,13 +133,14 @@ EOF
         env:
           MAX_ATTEMPTS: ${{ env.MAX_ATTEMPTS }}
           CONTINUE_ON_FAIL: ${{ env.CONTINUE_ON_FAIL }}
+          TIMEOUT_SECONDS: ${{ env.DEFAULT_TIMEOUT_SECONDS }}
         run: |
           set -Eeuo pipefail
           echo "--- Starting Lite PSG Generation ---"
           if [ -d lite ]; then
             pushd lite
             ../../.github/scripts/run_php_retry.sh channelsAssets.php
-            TIMEOUT_SECONDS=${{ env.LARGE_TIMEOUT_SECONDS }} ../../.github/scripts/run_php_retry.sh get.php
+            ../../.github/scripts/run_php_retry.sh get.php
             ../../.github/scripts/run_php_retry.sh duplicate.php
             ../../.github/scripts/run_php_retry.sh sort.php
             ../../.github/scripts/run_php_retry.sh toSingbox.php
@@ -184,7 +161,7 @@ EOF
           fi
 
       - name: Upload logs & artifacts (always)
-        if: always()
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: psg-output-${{ github.run_id }}
@@ -199,22 +176,22 @@ EOF
 
       - name: Commit and push changes (safe)
         env:
-          PUSH_TOKEN: ${{ env.PUSH_TOKEN }}
+          PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
         run: |
           set -Eeuo pipefail
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git add -A
           if git diff --cached --quiet; then
             echo "No changes to commit."
-          else
-            msg="🚀 Subscription Update | $(date '+%Y-%m-%d %H:%M:%S %Z')"
-            git commit -m "$msg"
-            BRANCH="${GITHUB_REF#refs/heads/}"
-            # If user supplied PUSH_TOKEN secret, use it (useful for cross-repo or elevated rights)
-            if [ -n "${PUSH_TOKEN:-}" ]; then
-              git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${{ github.repository }}.git
-            fi
-            git pull --rebase --autostash origin "$BRANCH" || true
-            git push origin HEAD:"$BRANCH"
+            exit 0
           fi
+          msg="🚀 Subscription Update | $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          git commit -m "$msg"
+          BRANCH=${GITHUB_REF##*/}
+          if [ -n "${PUSH_TOKEN:-}" ]; then
+            git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${{ github.repository }}.git
+          fi
+          git pull --rebase --autostash origin "$BRANCH" || true
+          git push origin HEAD:"$BRANCH"
