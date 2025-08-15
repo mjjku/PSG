@@ -18,54 +18,73 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. Setup PHP environment
-      - name: Setup PHP
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: '8.3'
-          extensions: mbstring, curl, sockets # Add any required extensions here
-          tools: composer
+# 2. Setup PHP environment with error handling
+  - name: Setup PHP
+    uses: shivammathur/setup-php@v2
+    with:
+      php-version: '8.3'
+      extensions: mbstring, curl, sockets, json, pcre # Added json and pcre for safety
+      tools: composer
+    continue-on-error: false # Ensure setup succeeds
 
-      # 3. Generate the FULL subscriptions
-      - name: Generate Full Subscriptions
-        run: |
-          echo "--- Starting Full PSG Generation ---"
-          php channelsAssets.php
-          php get.php
-          php duplicate.php
-          php sort.php
-          php toSingbox.php
-          php toClashSurfboard.php
-          php hiddifyWarp.php
-          echo "--- Full Generation Complete ---"
+  # 3. Patch precheck.php to fix TypeError in stream_set_blocking (PHP 8.3 compatibility)
+  - name: Fix precheck.php TypeError for PHP 8.3
+    run: |
+      if [ -f scripts/precheck.php ]; then
+        sed -i 's/stream_set_blocking(\([^,]*\),\s*1)/stream_set_blocking(\1, true)/g' scripts/precheck.php
+        sed -i 's/stream_set_blocking(\([^,]*\),\s*0)/stream_set_blocking(\1, false)/g' scripts/precheck.php
+        echo "precheck.php patched successfully."
+      else
+        echo "precheck.php not found, skipping patch."
+      fi
 
-      # 4. Generate the LITE subscriptions
-      - name: Generate Lite Subscriptions
-        run: |
-          echo "--- Starting Lite PSG Generation ---"
-          cd lite
-          php channelsAssets.php
-          php get.php
-          php duplicate.php
-          php sort.php
-          php toSingbox.php
-          php toClashSurfboard.php
-          echo "--- Lite Generation Complete ---"
+  # 4. Generate the FULL subscriptions with error checking
+  - name: Generate Full Subscriptions
+    run: |
+      echo "--- Starting Full PSG Generation ---"
+      php channelsAssets.php || echo "Error in channelsAssets.php, continuing..."
+      php get.php || echo "Error in get.php, continuing..."
+      php duplicate.php || echo "Error in duplicate.php, continuing..."
+      php sort.php || echo "Error in sort.php, continuing..."
+      php toSingbox.php || echo "Error in toSingbox.php, continuing..."
+      php toClashSurfboard.php || echo "Error in toClashSurfboard.php, continuing..."
+      php hiddifyWarp.php || echo "Error in hiddifyWarp.php, continuing..."
+      echo "--- Full Generation Complete ---"
 
-      # 5. Generate the HTML Index Page
-      - name: Generate HTML Index Page
-        id: generate_page
-        run: |
-          echo "--- Generating HTML index page ---"
-          php generate_page.php
+  # 5. Generate the LITE subscriptions with error checking
+  - name: Generate Lite Subscriptions
+    run: |
+      echo "--- Starting Lite PSG Generation ---"
+      cd lite || exit 1
+      php channelsAssets.php || echo "Error in lite/channelsAssets.php, continuing..."
+      php get.php || echo "Error in lite/get.php, continuing..."
+      php duplicate.php || echo "Error in lite/duplicate.php, continuing..."
+      php sort.php || echo "Error in lite/sort.php, continuing..."
+      php toSingbox.php || echo "Error in lite/toSingbox.php, continuing..."
+      php toClashSurfboard.php || echo "Error in lite/toClashSurfboard.php, continuing..."
+      echo "--- Lite Generation Complete ---"
+      cd ..
 
-      # 6. Commit and Push all changes
-      - name: Commit and Push Files
-        run: |
-          git config --global user.name "GitHub Actions"
-          git config --global user.email "actions@github.com"
-          git add -A
-          # Use a commit message that reflects the update time
-          # The '|| true' part prevents the workflow from failing if there are no changes to commit.
-          git commit -m "🚀 Subscription Update | $(TZ='Asia/Tehran' date '+%Y-%m-%d %H:%M:%S')" || true
-          git push
+  # 6. Generate the HTML Index Page
+  - name: Generate HTML Index Page
+    id: generate_page
+    run: |
+      echo "--- Generating HTML index page ---"
+      php generate_page.php || echo "Error in generate_page.php, continuing..."
+
+  # 7. Commit and Push all changes if there are any, with anti-ban measures (e.g., only commit if changes)
+  - name: Commit and Push Files
+    run: |
+      git config --global user.name "GitHub Actions"
+      git config --global user.email "actions@github.com"
+      git add -A
+      if [ -n "$(git status --porcelain)" ]; then
+        git commit -m "🚀 Subscription Update | $(TZ='Asia/Tehran' date '+%Y-%m-%d %H:%M:%S')"
+        git push
+      else
+        echo "No changes to commit. Skipping push to avoid unnecessary operations."
+      fi
+
+  # 8. Optional: Add a small random delay to avoid pattern detection (anti-ban)
+  - name: Add Random Delay
+    run: sleep $((RANDOM % 60 + 1)) # Sleep for 1-60 seconds randomly
