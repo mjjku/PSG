@@ -3,7 +3,7 @@ name: "Proxy Subscription Generator (PSG) — Proxy-aware"
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/2 * * *'  # Changed to every 2 hours to reduce frequency and avoid potential bans
+    - cron: '7 * * * *'
 
 permissions:
   contents: write
@@ -14,10 +14,10 @@ concurrency:
 
 env:
   TZ: 'Asia/Tehran'
-  JITTER_MAX_SECONDS: '300'  # Increased jitter for better anti-rate-limiting
-  MAX_ATTEMPTS: '5'  # Increased retries
-  DEFAULT_TIMEOUT_SECONDS: '1200'  # Increased timeout
-  LARGE_TIMEOUT_SECONDS: '7200'  # Increased large timeout
+  JITTER_MAX_SECONDS: '120'
+  MAX_ATTEMPTS: '5'
+  DEFAULT_TIMEOUT_SECONDS: '1200'
+  LARGE_TIMEOUT_SECONDS: '7200'
   CONTINUE_ON_FAIL: '1'
 
 jobs:
@@ -43,6 +43,7 @@ jobs:
           tools: composer
 
       - name: Export optional proxy env (if provided in secrets)
+        # This step exports http(s)_proxy env vars for subprocesses (PHP/cURL respects these too).
         env:
           PROXY_URL: ${{ secrets.PROXY_URL || '' }}
           PROXY_USER: ${{ secrets.PROXY_USER || '' }}
@@ -50,6 +51,7 @@ jobs:
         run: |
           if [ -n "${PROXY_URL:-}" ]; then
             echo "Proxy configured. Exporting proxy environment variables."
+            # If PROXY_USER/PASS provided, build authenticated proxy url
             if [ -n "${PROXY_USER:-}" ] && [ -n "${PROXY_PASS:-}" ]; then
               AUTH=$(python3 - <<'PY'
 import urllib.parse, os
@@ -58,28 +60,18 @@ p=os.environ.get("PROXY_PASS")
 print(urllib.parse.quote(u, safe='') + ':' + urllib.parse.quote(p, safe=''))
 PY
 )
-              export_proxy="${PROXY_URL//${AUTH}@/}"  # Ensure correct format
-              export_proxy="http://${AUTH}@${export_proxy#http://}"
+              export_proxy="http://${AUTH}@${PROXY_URL#http://}"
             else
               export_proxy="${PROXY_URL}"
             fi
             echo "http_proxy=${export_proxy}" >> $GITHUB_ENV
             echo "https_proxy=${export_proxy}" >> $GITHUB_ENV
+            # also set uppercase (some tools look for uppercase)
             echo "HTTP_PROXY=${export_proxy}" >> $GITHUB_ENV
             echo "HTTPS_PROXY=${export_proxy}" >> $GITHUB_ENV
           else
             echo "No PROXY_URL secret set — running without upstream proxy."
           fi
-
-      - name: Test Proxy Connectivity
-        if: env.http_proxy != ''
-        run: |
-          set -Eeuo pipefail
-          echo "Testing proxy connectivity..."
-          curl -I -m 10 --proxy "${http_proxy}" https://www.example.com || {
-            echo "Proxy test failed. Unsetting proxy to avoid errors."
-            unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
-          }
 
       - name: Preflight & patch PHP8
         run: |
@@ -104,13 +96,9 @@ for i in $(seq 1 $MAX_ATTEMPTS); do
   echo "Attempt $i/$MAX_ATTEMPTS: php $SCRIPT $*"
   if timeout --foreground ${TIMEOUT_SECONDS}s php "$SCRIPT" "$@"; then
     exit 0
-  else
-    echo "Attempt $i failed." | tee -a .github/logs/failed_attempts.log
   fi
   if [ "$i" -lt "$MAX_ATTEMPTS" ]; then
-    SLEEP_TIME=$((10 * 2**((i-1)) + RANDOM % 20))  # Increased backoff with more randomness
-    echo "Retrying after $SLEEP_TIME seconds..."
-    sleep $SLEEP_TIME
+    sleep $((10 * 2**(i-1) + RANDOM % 20))
   fi
 done
 echo "ALL ATTEMPTS FAILED for $SCRIPT" | tee -a .github/logs/failed_steps.log
@@ -156,9 +144,19 @@ EOF
             popd
           fi
 
+      - name: Delay between generations for anti-rate-limiting
+        run: sleep $((30 + RANDOM % 60))
+
       - name: Generate HTML
         run: |
           if [ -f generate_page.php ]; then php generate_page.php || true; fi
+
+      - name: Unset proxy for GitHub operations
+        run: |
+          unset http_proxy
+          unset https_proxy
+          unset HTTP_PROXY
+          unset HTTPS_PROXY
 
       - name: Upload artifacts (always)
         if: ${{ always() }}
@@ -172,11 +170,11 @@ EOF
           if-no-files-found: ignore
 
       - name: Commit & push
+        continue-on-error: true
         env:
           PUSH_TOKEN: ${{ secrets.PUSH_TOKEN || '' }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY  # Unset proxy for git operations to avoid potential issues or bans
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
@@ -187,4 +185,4 @@ EOF
             git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${{ github.repository }}.git
           fi
           git pull --rebase --autostash origin "$BRANCH" || true
-          git push origin HEAD:"$BRANCH" || echo "Push failed, but continuing due to CONTINUE_ON_FAIL"
+          git push origin HEAD:"$BRANCH" || true
