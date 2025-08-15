@@ -1,4 +1,4 @@
-name: "Proxy Subscription Generator (PSG) — Proxy-aware"
+name: "Proxy Subscription Generator (PSG)"
 
 on:
   workflow_dispatch:
