@@ -53,13 +53,7 @@ jobs:
             echo "Proxy configured. Exporting proxy environment variables."
             # If PROXY_USER/PASS provided, build authenticated proxy url
             if [ -n "${PROXY_USER:-}" ] && [ -n "${PROXY_PASS:-}" ]; then
-              AUTH=$(python3 - <<'PY'
-import urllib.parse, os
-u=os.environ.get("PROXY_USER")
-p=os.environ.get("PROXY_PASS")
-print(urllib.parse.quote(u, safe='') + ':' + urllib.parse.quote(p, safe=''))
-PY
-)
+              AUTH=$(python3 -c 'import urllib.parse, os; u=os.environ.get("PROXY_USER"); p=os.environ.get("PROXY_PASS"); print(urllib.parse.quote(u, safe="") + ":" + urllib.parse.quote(p, safe=""))')
               export_proxy="http://${AUTH}@${PROXY_URL#http://}"
             else
               export_proxy="${PROXY_URL}"
