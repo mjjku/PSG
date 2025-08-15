@@ -15,10 +15,6 @@ permissions:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    env:
-      http_proxy: ${{ secrets.HTTP_PROXY }}
-      https_proxy: ${{ secrets.HTTPS_PROXY }}
-      no_proxy: "*.github.com,github.com,localhost,127.0.0.1"
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -32,24 +28,6 @@ jobs:
           php-version: '8.3'
           extensions: mbstring, curl, sockets
           tools: composer
-
-      - name: Setup Cloudflare WARP
-        run: |
-          set -e
-          echo "--- Setting up official Cloudflare WARP client ---"
-          sudo apt-get update && sudo apt-get install -y apt-transport-https lsb-release gnupg
-          curl https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-          sudo apt-get update && sudo apt-get install -y cloudflare-warp
-          warp-cli --version
-          warp-cli --accept-tos registration new
-          warp-cli connect
-          if curl https://www.cloudflare.com/cdn-cgi/trace/ | grep -q "warp=on"; then
-            echo "✅ Cloudflare WARP connected successfully"
-          else
-            echo "❌ Failed to connect Cloudflare WARP" && exit 1
-          fi
-          echo "--- ✅ Cloudflare WARP setup complete ---"
 
       - name: Patch precheck.php for PHP 8 compatibility
         run: |
@@ -93,12 +71,6 @@ jobs:
           echo "--- Generating HTML index page ---"
           php generate_page.php || { echo "❌ generate_page.php failed"; exit 1; }
           echo "--- ✅ HTML index page generated ---"
-
-      - name: Disconnect Cloudflare WARP
-        if: always()
-        run: |
-          warp-cli disconnect || true
-          echo "ℹ️ Cloudflare WARP disconnected"
 
       - name: Commit and Push Files
         env:
