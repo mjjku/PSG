@@ -19,8 +19,6 @@ env:
   DEFAULT_TIMEOUT_SECONDS: '900'
   LARGE_TIMEOUT_SECONDS: '3600'
   CONTINUE_ON_FAIL: '1'
-  RETRY_BACKOFF_FACTOR: '2'  # Exponential backoff factor for retries
-  MIN_JITTER_SECONDS: '30'   # Minimum jitter to avoid rate limits and bans
 
 jobs:
   build-and-deploy:
@@ -33,6 +31,9 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: true
+
+      - name: Jitter delay for anti-rate-limiting
+        run: sleep $((RANDOM % ${JITTER_MAX_SECONDS}))
 
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
@@ -52,19 +53,22 @@ jobs:
             echo "Proxy configured. Exporting proxy environment variables."
             # If PROXY_USER/PASS provided, build authenticated proxy url
             if [ -n "${PROXY_USER:-}" ] && [ -n "${PROXY_PASS:-}" ]; then
-              AUTH=$(python3 -c "import urllib.parse, os; u = os.environ.get('PROXY_USER'); p = os.environ.get('PROXY_PASS'); print(urllib.parse.quote(u, safe='') + ':' + urllib.parse.quote(p, safe=''))")
+              AUTH=$(python3 - <<'PY'
+import urllib.parse, os
+u=os.environ.get("PROXY_USER")
+p=os.environ.get("PROXY_PASS")
+print(urllib.parse.quote(u, safe='') + ':' + urllib.parse.quote(p, safe=''))
+PY
+)
               export_proxy="http://${AUTH}@${PROXY_URL#http://}"
             else
               export_proxy="${PROXY_URL}"
             fi
             echo "http_proxy=${export_proxy}" >> $GITHUB_ENV
             echo "https_proxy=${export_proxy}" >> $GITHUB_ENV
-            # also set lowercase (some tools look for lowercase)
+            # also set uppercase (some tools look for uppercase)
             echo "HTTP_PROXY=${export_proxy}" >> $GITHUB_ENV
             echo "HTTPS_PROXY=${export_proxy}" >> $GITHUB_ENV
-            # Set no_proxy to avoid proxying internal/local requests
-            echo "no_proxy=localhost,127.0.0.1,::1" >> $GITHUB_ENV
-            echo "NO_PROXY=localhost,127.0.0.1,::1" >> $GITHUB_ENV
           else
             echo "No PROXY_URL secret set — running without upstream proxy."
           fi
@@ -74,13 +78,9 @@ jobs:
           set -Eeuo pipefail
           php -v
           if [ -f scripts/precheck.php ]; then
-            sed -i 's/stream_set_blocking(\([^,]*\), *0)/stream_set_blocking(\1, false)/g' scripts/precheck.php || true
-            sed -i 's/stream_set_blocking(\([^,]*\), *1)/stream_set_blocking(\1, true)/g' scripts/precheck.php || true
+            sed -i 's/stream_set_blocking(\([^,]*\), *0)/stream_set_blocking(\1, false)/g' scripts/precheck.php
+            sed -i 's/stream_set_blocking(\([^,]*\), *1)/stream_set_blocking(\1, true)/g' scripts/precheck.php
           fi
-          # Add a preflight check for dependencies
-          php -r "extension_loaded('curl') or die('cURL extension missing');"
-          php -r "extension_loaded('mbstring') or die('mbstring extension missing');"
-          php -r "extension_loaded('sockets') or die('sockets extension missing');"
 
       - name: Create run wrapper
         run: |
@@ -91,23 +91,14 @@ set -euo pipefail
 MAX_ATTEMPTS=${MAX_ATTEMPTS:-4}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-900}
 CONTINUE_ON_FAIL=${CONTINUE_ON_FAIL:-1}
-RETRY_BACKOFF_FACTOR=${RETRY_BACKOFF_FACTOR:-2}
-MIN_JITTER_SECONDS=${MIN_JITTER_SECONDS:-30}
-JITTER_MAX_SECONDS=${JITTER_MAX_SECONDS:-120}
 SCRIPT="$1"; shift || true
 for i in $(seq 1 $MAX_ATTEMPTS); do
   echo "Attempt $i/$MAX_ATTEMPTS: php $SCRIPT $*"
   if timeout --foreground ${TIMEOUT_SECONDS}s php "$SCRIPT" "$@"; then
     exit 0
-  else
-    echo "Attempt $i failed for $SCRIPT" >&2
   fi
   if [ "$i" -lt "$MAX_ATTEMPTS" ]; then
-    BACKOFF=$((RETRY_BACKOFF_FACTOR ** (i-1)))
-    JITTER=$((MIN_JITTER_SECONDS + RANDOM % (JITTER_MAX_SECONDS - MIN_JITTER_SECONDS + 1)))
-    SLEEP_TIME=$((BACKOFF + JITTER))
-    echo "Retrying after $SLEEP_TIME seconds (backoff: $BACKOFF, jitter: $JITTER)" >&2
-    sleep $SLEEP_TIME
+    sleep $((5 * 2**(i-1) + RANDOM % 10))
   fi
 done
 echo "ALL ATTEMPTS FAILED for $SCRIPT" | tee -a .github/logs/failed_steps.log
@@ -123,9 +114,6 @@ EOF
           MAX_ATTEMPTS: ${{ env.MAX_ATTEMPTS }}
           CONTINUE_ON_FAIL: ${{ env.CONTINUE_ON_FAIL }}
           TIMEOUT_SECONDS: ${{ env.LARGE_TIMEOUT_SECONDS }}
-          RETRY_BACKOFF_FACTOR: ${{ env.RETRY_BACKOFF_FACTOR }}
-          MIN_JITTER_SECONDS: ${{ env.MIN_JITTER_SECONDS }}
-          JITTER_MAX_SECONDS: ${{ env.JITTER_MAX_SECONDS }}
         run: |
           set -Eeuo pipefail
           echo "--- Full ---"
@@ -143,9 +131,6 @@ EOF
           MAX_ATTEMPTS: ${{ env.MAX_ATTEMPTS }}
           CONTINUE_ON_FAIL: ${{ env.CONTINUE_ON_FAIL }}
           TIMEOUT_SECONDS: ${{ env.DEFAULT_TIMEOUT_SECONDS }}
-          RETRY_BACKOFF_FACTOR: ${{ env.RETRY_BACKOFF_FACTOR }}
-          MIN_JITTER_SECONDS: ${{ env.MIN_JITTER_SECONDS }}
-          JITTER_MAX_SECONDS: ${{ env.JITTER_MAX_SECONDS }}
         run: |
           set -Eeuo pipefail
           if [ -d lite ]; then
@@ -160,15 +145,8 @@ EOF
           fi
 
       - name: Generate HTML
-        env:
-          MAX_ATTEMPTS: ${{ env.MAX_ATTEMPTS }}
-          CONTINUE_ON_FAIL: ${{ env.CONTINUE_ON_FAIL }}
-          TIMEOUT_SECONDS: ${{ env.DEFAULT_TIMEOUT_SECONDS }}
-          RETRY_BACKOFF_FACTOR: ${{ env.RETRY_BACKOFF_FACTOR }}
-          MIN_JITTER_SECONDS: ${{ env.MIN_JITTER_SECONDS }}
-          JITTER_MAX_SECONDS: ${{ env.JITTER_MAX_SECONDS }}
         run: |
-          if [ -f generate_page.php ]; then ./.github/scripts/run_php_retry.sh generate_page.php || true; fi
+          if [ -f generate_page.php ]; then php generate_page.php || true; fi
 
       - name: Upload artifacts (always)
         if: ${{ always() }}
@@ -180,7 +158,6 @@ EOF
             index.html
             lite/**
           if-no-files-found: ignore
-          retention-days: 7  # Retain artifacts for 7 days to avoid storage bans
 
       - name: Commit & push
         env:
@@ -196,9 +173,5 @@ EOF
           if [ -n "${PUSH_TOKEN:-}" ]; then
             git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${{ github.repository }}.git
           fi
-          # Add jitter before push to avoid rate limiting
-          JITTER=$((RANDOM % JITTER_MAX_SECONDS + 1))
-          echo "Waiting $JITTER seconds before push to avoid bans..."
-          sleep $JITTER
           git pull --rebase --autostash origin "$BRANCH" || true
-          git push origin HEAD:"$BRANCH" --force-with-lease  # Safer push to avoid conflicts
+          git push origin HEAD:"$BRANCH"
