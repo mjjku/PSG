@@ -3,81 +3,69 @@ name: "Proxy Subscription Generator (PSG)"
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 * * * *' # Run every hour exactly
+    - cron: '*/60 * * * *' # Runs every 60 minutes
 
+# Use a concurrency group to ensure only one workflow runs at a time.
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: true
-
-permissions:
-  contents: write
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     steps:
+      # 1. Checkout the repository code
       - name: Checkout Code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: true
 
+      # 2. Setup PHP environment
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.3'
-          extensions: mbstring, curl, sockets
+          extensions: mbstring, curl, sockets # Add any required extensions here
           tools: composer
 
-      - name: Patch precheck.php for PHP 8 compatibility
-        run: |
-          if [ -f "scripts/precheck.php" ]; then
-            sed -i 's/stream_set_blocking(\([^,]*\), *0)/stream_set_blocking(\1, false)/g' scripts/precheck.php
-            sed -i 's/stream_set_blocking(\([^,]*\), *1)/stream_set_blocking(\1, true)/g' scripts/precheck.php
-            echo "✅ Patch applied to scripts/precheck.php"
-          else
-            echo "ℹ️ scripts/precheck.php not found, skipping patch."
-          fi
-
+      # 3. Generate the FULL subscriptions
       - name: Generate Full Subscriptions
         run: |
-          set -e
           echo "--- Starting Full PSG Generation ---"
-          php channelsAssets.php || { echo "❌ channelsAssets.php failed"; exit 1; }
-          php get.php || { echo "❌ get.php failed"; exit 1; }
-          php duplicate.php || { echo "❌ duplicate.php failed"; exit 1; }
-          php sort.php || { echo "❌ sort.php failed"; exit 1; }
-          php toSingbox.php || { echo "❌ toSingbox.php failed"; exit 1; }
-          php toClashSurfboard.php || { echo "❌ toClashSurfboard.php failed"; exit 1; }
-          php hiddifyWarp.php || { echo "❌ hiddifyWarp.php failed"; exit 1; }
-          echo "--- ✅ Full Generation Complete ---"
+          php channelsAssets.php
+          php get.php
+          php duplicate.php
+          php sort.php
+          php toSingbox.php
+          php toClashSurfboard.php
+          php hiddifyWarp.php
+          echo "--- Full Generation Complete ---"
 
+      # 4. Generate the LITE subscriptions
       - name: Generate Lite Subscriptions
         run: |
-          set -e
           echo "--- Starting Lite PSG Generation ---"
           cd lite
-          php channelsAssets.php || { echo "❌ channelsAssets.php failed"; exit 1; }
-          php get.php || { echo "❌ get.php failed"; exit 1; }
-          php duplicate.php || { echo "❌ duplicate.php failed"; exit 1; }
-          php sort.php || { echo "❌ sort.php failed"; exit 1; }
-          php toSingbox.php || { echo "❌ toSingbox.php failed"; exit 1; }
-          php toClashSurfboard.php || { echo "❌ toClashSurfboard.php failed"; exit 1; }
-          echo "--- ✅ Lite Generation Complete ---"
+          php channelsAssets.php
+          php get.php
+          php duplicate.php
+          php sort.php
+          php toSingbox.php
+          php toClashSurfboard.php
+          echo "--- Lite Generation Complete ---"
 
+      # 5. Generate the HTML Index Page
       - name: Generate HTML Index Page
+        id: generate_page
         run: |
-          set -e
           echo "--- Generating HTML index page ---"
-          php generate_page.php || { echo "❌ generate_page.php failed"; exit 1; }
-          echo "--- ✅ HTML index page generated ---"
+          php generate_page.php
 
+      # 6. Commit and Push all changes
       - name: Commit and Push Files
-        env:
-          TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
           git add -A
-          git commit -m "🚀 Subscription Update | $(TZ='Asia/Tehran' date '+%Y-%m-%d %H:%M:%S')" || echo "ℹ️ No changes to commit."
-          git push https://x-access-token:${TOKEN}@github.com/${{ github.repository }} HEAD:${GITHUB_REF}
+          # Use a commit message that reflects the update time
+          # The '|| true' part prevents the workflow from failing if there are no changes to commit.
+          git commit -m "🚀 Subscription Update | $(TZ='Asia/Tehran' date '+%Y-%m-%d %H:%M:%S')" || true
+          git push
