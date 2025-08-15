@@ -3,7 +3,7 @@ name: "Proxy Subscription Generator (PSG) — Proxy-aware"
 on:
   workflow_dispatch:
   schedule:
-    - cron: '7 * * * *'
+    - cron: '*/60 * * * *' # Runs every 60 minutes
 
 permissions:
   contents: write
