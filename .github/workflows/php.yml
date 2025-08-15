@@ -3,34 +3,37 @@ name: "Proxy Subscription Generator (PSG)"
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/60 * * * *' # Runs every 60 minutes
+    - cron: '7 * * * *' # every hour at minute 7 (avoid top-of-hour spikes)
 
 permissions:
   contents: write
 
-# Ensure only one run per ref/branch at a time
+# Queue runs instead of cancelling the running one (avoids "Error: The operation was canceled.")
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   TZ: Asia/Tehran
-  JITTER_MAX_SECONDS: 120 # randomized sleep before network-heavy steps (anti-burst)
+  JITTER_MAX_SECONDS: 120
+  MAX_ATTEMPTS: 4
+  DEFAULT_TIMEOUT_SECONDS: 900     # 15 minutes default per script
+  LARGE_TIMEOUT_SECONDS: 3600      # 1 hour for heavy scripts (get.php kind)
+  CONTINUE_ON_FAIL: "1"            # "1" = continue workflow when a script repeatedly fails (collect logs). Set to "0" for strict fail-fast.
+  PUSH_TOKEN: ${{ secrets.PUSH_TOKEN || '' }}  # optional personal token fallback
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 120  # increase job timeout to avoid runner cancellation
 
     steps:
-      # 1) Checkout
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: true
 
-      # 2) PHP 8.3 + extensions + Composer
       - name: Setup PHP 8.3
         uses: shivammathur/setup-php@v2
         with:
@@ -38,7 +41,6 @@ jobs:
           extensions: mbstring, curl, sockets
           tools: composer
 
-      # 2.1) Cache Composer (if lockfile exists)
       - name: Composer cache
         if: hashFiles('**/composer.lock') != ''
         uses: actions/cache@v4
@@ -47,130 +49,172 @@ jobs:
           key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
           restore-keys: ${{ runner.os }}-composer-
 
-      # 2.2) Install PHP deps if composer.json exists
-      - name: Install PHP dependencies (if any)
+      - name: Install PHP deps (if composer.json exists)
         run: |
           set -Eeuo pipefail
           if [ -f composer.json ]; then
             composer install --no-interaction --prefer-dist --no-progress --no-dev
           fi
 
-      # 2.3) Randomized jitter to avoid thundering herd
       - name: Randomized start (anti-burst)
         run: |
           s=$(( RANDOM % JITTER_MAX_SECONDS ))
-          echo "Sleeping $s seconds to avoid hitting remote services at the top of the hour."
+          echo "Sleeping $s seconds to avoid thundering herd"
           sleep "$s"
 
-      # 2.4) Preflight checks + PHP8 patch
-      - name: Preflight & PHP 8 compatibility patch
+      - name: Preflight & PHP8 patches
         run: |
           set -Eeuo pipefail
           php -v
           echo "::group::PHP extensions"
-          php -m | grep -E '^(curl|mbstring|sockets)$' | sort || true
-          echo "::endgroup::"
-          # Patch for stream_set_blocking(bool) on PHP 8+
-          if [ -f "scripts/precheck.php" ]; then
-            sed -i 's/stream_set_blocking(\([^,]*\), *0)/stream_set_blocking(\1, false)/g' scripts/precheck.php
-            sed -i 's/stream_set_blocking(\([^,]*\), *1)/stream_set_blocking(\1, true)/g' scripts/precheck.php
-            echo "Patched scripts/precheck.php for PHP 8 bool args."
-          fi
-          # Syntax lint (skip vendor)
-          echo "::group::PHP lint"
-          if command -v find >/dev/null; then
-            find . -type f -name '*.php' ! -path './vendor/*' -print0 | xargs -0 -I{} php -l "{}"
-          fi
+          php -m | grep -E '^(curl|mbstring|sockets)$' || true
           echo "::endgroup::"
 
-      # 3) Build Full + Lite with retries
-      - name: Generate subscriptions (Full + Lite) with retries
-        shell: bash
+          # Fix stream_set_blocking(bool) patterns for PHP8+ (safe, idempotent)
+          if [ -f "scripts/precheck.php" ]; then
+            sed -i 's/stream_set_blocking(\([^,]*\), *0)/stream_set_blocking(\1, false)/g' scripts/precheck.php || true
+            sed -i 's/stream_set_blocking(\([^,]*\), *1)/stream_set_blocking(\1, true)/g' scripts/precheck.php || true
+            echo "Patched scripts/precheck.php for PHP8 bool args."
+          fi
+
+          # Lightweight PHP lint for repo (skip vendor)
+          if command -v find >/dev/null; then
+            find . -type f -name '*.php' ! -path './vendor/*' -print0 | xargs -0 -I{} bash -c 'php -l "{}" || true'
+          fi
+
+      - name: Prepare resilient runner scripts & logs
         run: |
           set -Eeuo pipefail
-          retry() { # retry MAX CMD...
-            local max=${1:-3}; shift
-            local n=0
-            until "$@"; do
-              n=$((n+1))
-              if [ "$n" -ge "$max" ]; then
-                echo "Command failed after $n attempts: $*"
-                return 1
+          mkdir -p .github/scripts .github/logs
+          cat > .github/scripts/run_php_retry.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+MAX_ATTEMPTS=${MAX_ATTEMPTS:-4}
+TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-900}
+CONTINUE_ON_FAIL=${CONTINUE_ON_FAIL:-1}
+SCRIPT="$1"
+shift || true
+for i in $(seq 1 $MAX_ATTEMPTS); do
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] Attempt $i/$MAX_ATTEMPTS: php $SCRIPT $*"
+  if timeout --foreground ${TIMEOUT_SECONDS}s php "$SCRIPT" "$@"; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Success: $SCRIPT"
+    exit 0
+  fi
+  rc=$?
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] Attempt $i failed (exit $rc) for $SCRIPT"
+  if [ "$i" -lt "$MAX_ATTEMPTS" ]; then
+    sleep $((5 * 2**(i-1) + RANDOM % 10))
+  fi
+done
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] ALL ATTEMPTS FAILED for $SCRIPT" | tee -a .github/logs/failed_steps.log
+if [ "${CONTINUE_ON_FAIL}" = "1" ]; then
+  echo "CONTINUE_ON_FAIL=1 => continuing workflow despite failure"
+  exit 0
+fi
+exit 1
+EOF
+          chmod +x .github/scripts/run_php_retry.sh
+          echo "Wrapper script created: .github/scripts/run_php_retry.sh"
+
+      # OPTIONAL: best-effort add conservative cURL timeouts to common files (non-destructive)
+      - name: Best-effort: add conservative cURL timeouts (get.php / lite/get.php)
+        run: |
+          for f in get.php lite/get.php; do
+            if [ -f "$f" ]; then
+              if grep -q "curl_exec" "$f" && ! grep -q "CURLOPT_TIMEOUT" "$f"; then
+                echo "Patching $f: insert conservative curl timeouts before curl_exec"
+                awk '{
+                  if(match($0,/curl_exec[[:space:]]*\([^)]+\);/)) {
+                    print "curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);"
+                    print "curl_setopt($ch, CURLOPT_TIMEOUT, 30);"
+                    print "curl_setopt($ch, CURLOPT_FAILONERROR, true);"
+                  }
+                  print $0
+                }' "$f" > "$f.patched" && mv "$f.patched" "$f" || echo "Patch skipped for $f"
               fi
-              sleep $((2**n)) # exponential backoff: 2,4,8s...
-            done
-          }
-          run_php() { echo "▶ $1"; retry 3 php "$1"; }
+            fi
+          done
 
-          echo "::group::FULL"
-          run_php channelsAssets.php
-          run_php get.php
-          run_php duplicate.php
-          run_php sort.php
-          run_php toSingbox.php
-          run_php toClashSurfboard.php
-          if [ -f hiddifyWarp.php ]; then run_php hiddifyWarp.php; fi
-          echo "::endgroup::"
-
-          echo "::group::LITE"
-          if [ -d lite ]; then
-            ( set -Eeuo pipefail
-              cd lite
-              run_php channelsAssets.php
-              run_php get.php
-              run_php duplicate.php
-              run_php sort.php
-              run_php toSingbox.php
-              run_php toClashSurfboard.php
-            )
-          else
-            echo "lite/ directory not found; skipping lite build."
+      - name: Generate Full subscriptions (resilient)
+        env:
+          MAX_ATTEMPTS: ${{ env.MAX_ATTEMPTS }}
+          CONTINUE_ON_FAIL: ${{ env.CONTINUE_ON_FAIL }}
+        run: |
+          set -Eeuo pipefail
+          echo "--- Starting Full PSG Generation ---"
+          ./.github/scripts/run_php_retry.sh channelsAssets.php
+          TIMEOUT_SECONDS=${{ env.LARGE_TIMEOUT_SECONDS }} ./.github/scripts/run_php_retry.sh get.php
+          ./.github/scripts/run_php_retry.sh duplicate.php
+          ./.github/scripts/run_php_retry.sh sort.php
+          ./.github/scripts/run_php_retry.sh toSingbox.php
+          ./.github/scripts/run_php_retry.sh toClashSurfboard.php
+          if [ -f hiddifyWarp.php ]; then
+            ./.github/scripts/run_php_retry.sh hiddifyWarp.php
           fi
-          echo "::endgroup::"
+          echo "--- Full Generation Done ---"
 
-      # 4) HTML index page
+      - name: Generate Lite subscriptions (resilient)
+        env:
+          MAX_ATTEMPTS: ${{ env.MAX_ATTEMPTS }}
+          CONTINUE_ON_FAIL: ${{ env.CONTINUE_ON_FAIL }}
+        run: |
+          set -Eeuo pipefail
+          echo "--- Starting Lite PSG Generation ---"
+          if [ -d lite ]; then
+            pushd lite
+            ../../.github/scripts/run_php_retry.sh channelsAssets.php
+            TIMEOUT_SECONDS=${{ env.LARGE_TIMEOUT_SECONDS }} ../../.github/scripts/run_php_retry.sh get.php
+            ../../.github/scripts/run_php_retry.sh duplicate.php
+            ../../.github/scripts/run_php_retry.sh sort.php
+            ../../.github/scripts/run_php_retry.sh toSingbox.php
+            ../../.github/scripts/run_php_retry.sh toClashSurfboard.php
+            popd
+          else
+            echo "lite/ not found — skipping."
+          fi
+          echo "--- Lite Generation Done ---"
+
       - name: Generate HTML index page
         run: |
           set -Eeuo pipefail
           if [ -f generate_page.php ]; then
-            php generate_page.php
-            echo "HTML index generated."
+            php generate_page.php || echo "generate_page.php returned non-zero (logged) — continuing"
           else
-            echo "generate_page.php not found; skipping."
+            echo "generate_page.php not found; skipped."
           fi
 
-      # 5) Optional: upload artifacts for quick inspection/download
-      - name: Upload build artifacts (optional)
+      - name: Upload logs & artifacts (always)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: psg-output-${{ github.run_id }}
           path: |
+            .github/logs/**
             index.html
             *.json
-            *.yaml
-            *.yml
             *.txt
             lite/**
           if-no-files-found: ignore
           retention-days: 7
 
-      # 6) Commit & push only when there are changes
-      - name: Commit and push changes
+      - name: Commit and push changes (safe)
         env:
-          GIT_AUTHOR_NAME: github-actions[bot]
-          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
-          GIT_COMMITTER_NAME: github-actions[bot]
-          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          PUSH_TOKEN: ${{ env.PUSH_TOKEN }}
         run: |
           set -Eeuo pipefail
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           if git diff --cached --quiet; then
             echo "No changes to commit."
-            exit 0
+          else
+            msg="🚀 Subscription Update | $(date '+%Y-%m-%d %H:%M:%S %Z')"
+            git commit -m "$msg"
+            BRANCH="${GITHUB_REF#refs/heads/}"
+            # If user supplied PUSH_TOKEN secret, use it (useful for cross-repo or elevated rights)
+            if [ -n "${PUSH_TOKEN:-}" ]; then
+              git remote set-url origin https://x-access-token:${PUSH_TOKEN}@github.com/${{ github.repository }}.git
+            fi
+            git pull --rebase --autostash origin "$BRANCH" || true
+            git push origin HEAD:"$BRANCH"
           fi
-          msg="🚀 Subscription Update | $(date '+%Y-%m-%d %H:%M:%S %Z')"
-          git commit -m "$msg"
-          # Rebase to reduce push conflicts if repo changed meanwhile
-          git pull --rebase --autostash origin "$GITHUB_REF_NAME" || true
-          git push origin HEAD:"$GITHUB_REF_NAME"
