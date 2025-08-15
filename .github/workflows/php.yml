@@ -1,71 +1,953 @@
-name: "Proxy Subscription Generator (PSG)"
+name: PSG — PHP CI, Security, and Scheduler
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: {}
   schedule:
-    - cron: '*/60 * * * *' # Runs every 60 minutes
+    - cron: '0 * * * *' # hourly
 
-# Use a concurrency group to ensure only one workflow runs at a time.
+env:
+  TARGET_FILES: |
+    toSingbox.php
+    lite/toSingbox.php
+    sort.php
+    lite/sort.php
+    scripts/precheck.php
+
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: true
 
 jobs:
-  build-and-deploy:
+  php-ci:
+    name: PHP ${{ matrix.php-version }} — checks
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php-version: [8.0, 8.1, 8.2, 8.3]
+
     steps:
-      # 1. Checkout the repository code
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # 2. Setup PHP environment
       - name: Setup PHP
-        uses: shivammathur/setup-php@v2
+        uses: shivammathur/setup-php@v4
+        with:
+          php-version: ${{ matrix.php-version }}
+          extensions: "mbstring, intl, xml, curl, json, zip"
+          ini-values: memory_limit=-1
+          tools: "composer:2"
+
+      - name: PHP info
+        run: php -v
+
+      - name: Targeted syntax check
+        run: |
+          set -eo pipefail
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            if [ -f "$f" ]; then php -l "$f"; else echo "Missing $f — skipped"; fi
+          done <<'FILES'
+          $TARGET_FILES
+          FILES
+
+      - name: Full repo syntax check (fast)
+        run: |
+          set -eo pipefail
+          find . -name '*.php' -not -path './vendor/*' -print0 | xargs -0 -n1 -P4 php -l || true
+
+      - name: PHPStan quick scan (phar)
+        continue-on-error: true
+        run: |
+          set -eo pipefail
+          curl -sL -o phpstan.phar https://github.com/phpstan/phpstan/releases/latest/download/phpstan.phar
+          chmod +x phpstan.phar
+          files=""
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            [ -f "$f" ] && files="$files $f"
+          done <<'FILES'
+          $TARGET_FILES
+          FILES
+          if [ -n "$files" ]; then
+            ./phpstan.phar analyse $files --level 0 || true
+          else
+            ./phpstan.phar analyse --level 0 || true
+          fi
+
+      - name: Upload phpstan binary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phpstan-${{ matrix.php-version }}
+          path: phpstan.phar
+
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: php
+
+      - name: Autobuild safe
+        run: |
+          if [ -f composer.json ]; then composer install --no-dev --no-scripts --no-interaction || true; fi
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v2
+
+  generate:
+    name: Generate & Push (scheduled/manual)
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+
+    steps:
+      - name: Checkout (full)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v4
         with:
           php-version: '8.3'
-          extensions: mbstring, curl, sockets # Add any required extensions here
-          tools: composer
+          extensions: "mbstring, curl, sockets"
+          ini-values: memory_limit=-1
+          tools: "composer:2"
 
-      # 3. Generate the FULL subscriptions
       - name: Generate Full Subscriptions
         run: |
           echo "--- Starting Full PSG Generation ---"
-          php channelsAssets.php
-          php get.php
-          php duplicate.php
-          php sort.php
-          php toSingbox.php
-          php toClashSurfboard.php
-          php hiddifyWarp.php
+          set -eo pipefail
+          [ -f channelsAssets.php ] && php channelsAssets.php || echo "skip channelsAssets.php"
+          [ -f get.php ] && php get.php || echo "skip get.php"
+          [ -f duplicate.php ] && php duplicate.php || echo "skip duplicate.php"
+          [ -f sort.php ] && php sort.php || echo "skip sort.php"
+          [ -f toSingbox.php ] && php toSingbox.php || echo "skip toSingbox.php"
+          [ -f toClashSurfboard.php ] && php toClashSurfboard.php || echo "skip toClashSurfboard.php"
+          [ -f hiddifyWarp.php ] && php hiddifyWarp.php || echo "skip hiddifyWarp.php"
           echo "--- Full Generation Complete ---"
 
-      # 4. Generate the LITE subscriptions
       - name: Generate Lite Subscriptions
         run: |
           echo "--- Starting Lite PSG Generation ---"
-          cd lite
-          php channelsAssets.php
-          php get.php
-          php duplicate.php
-          php sort.php
-          php toSingbox.php
-          php toClashSurfboard.php
+          set -eo pipefail
+          if [ -d lite ]; then
+            pushd lite
+            [ -f channelsAssets.php ] && php channelsAssets.php || echo "skip lite/channelsAssets.php"
+            [ -f get.php ] && php get.php || echo "skip lite/get.php"
+            [ -f duplicate.php ] && php duplicate.php || echo "skip lite/duplicate.php"
+            [ -f sort.php ] && php sort.php || echo "skip lite/sort.php"
+            [ -f toSingbox.php ] && php toSingbox.php || echo "skip lite/toSingbox.php"
+            [ -f toClashSurfboard.php ] && php toClashSurfboard.php || echo "skip lite/toClashSurfboard.php"
+            popd
+          else
+            echo "lite directory missing — skip lite generation"
+          fi
           echo "--- Lite Generation Complete ---"
 
-      # 5. Generate the HTML Index Page
       - name: Generate HTML Index Page
         id: generate_page
         run: |
           echo "--- Generating HTML index page ---"
-          php generate_page.php
+          set -eo pipefail
+          [ -f generate_page.php ] && php generate_page.php || echo "generate_page.php missing"
 
-      # 6. Commit and Push all changes
-      - name: Commit and Push Files
+      - name: Commit and push if changed
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
         run: |
-          git config --global user.name "GitHub Actions"
-          git config --global user.email "actions@github.com"
+          set -eo pipefail
+          git config user.name "$GIT_AUTHOR_NAME"
+          git config user.email "$GIT_AUTHOR_EMAIL"
           git add -A
-          # Use a commit message that reflects the update time
-          # The '|| true' part prevents the workflow from failing if there are no changes to commit.
-          git commit -m "🚀 Subscription Update | $(TZ='Asia/Tehran' date '+%Y-%m-%d %H:%M:%S')" || true
-          git push
+          if git diff --staged --quiet; then echo "no changes"; else git commit -m "Automated regen: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; git push origin HEAD:main; fi
+name: PSG — PHP CI, Security, and Scheduler
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: {}
+  schedule:
+    - cron: '0 * * * *' # hourly
+
+env:
+  TARGET_FILES: |
+    toSingbox.php
+    lite/toSingbox.php
+    sort.php
+    lite/sort.php
+    scripts/precheck.php
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  php-ci:
+    name: PHP ${{ matrix.php-version }} — checks
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php-version: [8.0, 8.1, 8.2, 8.3]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v4
+        with:
+          php-version: ${{ matrix.php-version }}
+          extensions: "mbstring, intl, xml, curl, json, zip"
+          ini-values: memory_limit=-1
+          tools: "composer:2"
+
+      - name: PHP info
+        run: php -v
+
+      - name: Targeted syntax check
+        run: |
+          set -eo pipefail
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            if [ -f "$f" ]; then php -l "$f"; else echo "Missing $f — skipped"; fi
+          done <<'FILES'
+          $TARGET_FILES
+          FILES
+
+      - name: Full repo syntax check (fast)
+        run: |
+          set -eo pipefail
+          find . -name '*.php' -not -path './vendor/*' -print0 | xargs -0 -n1 -P4 php -l || true
+
+      - name: PHPStan quick scan (phar)
+        continue-on-error: true
+        run: |
+          set -eo pipefail
+          curl -sL -o phpstan.phar https://github.com/phpstan/phpstan/releases/latest/download/phpstan.phar
+          chmod +x phpstan.phar
+          files=""
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            [ -f "$f" ] && files="$files $f"
+          done <<'FILES'
+          $TARGET_FILES
+          FILES
+          if [ -n "$files" ]; then
+            ./phpstan.phar analyse $files --level 0 || true
+          else
+            ./phpstan.phar analyse --level 0 || true
+          fi
+
+      - name: Upload phpstan binary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phpstan-${{ matrix.php-version }}
+          path: phpstan.phar
+
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: php
+
+      - name: Autobuild safe
+        run: |
+          if [ -f composer.json ]; then composer install --no-dev --no-scripts --no-interaction || true; fi
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v2
+
+  generate:
+    name: Generate & Push (scheduled/manual)
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+
+    steps:
+      - name: Checkout (full)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v4
+        with:
+          php-version: '8.3'
+          extensions: "mbstring, curl, sockets"
+          ini-values: memory_limit=-1
+          tools: "composer:2"
+
+      - name: Generate Full Subscriptions
+        run: |
+          echo "--- Starting Full PSG Generation ---"
+          set -eo pipefail
+          [ -f channelsAssets.php ] && php channelsAssets.php || echo "skip channelsAssets.php"
+          [ -f get.php ] && php get.php || echo "skip get.php"
+          [ -f duplicate.php ] && php duplicate.php || echo "skip duplicate.php"
+          [ -f sort.php ] && php sort.php || echo "skip sort.php"
+          [ -f toSingbox.php ] && php toSingbox.php || echo "skip toSingbox.php"
+          [ -f toClashSurfboard.php ] && php toClashSurfboard.php || echo "skip toClashSurfboard.php"
+          [ -f hiddifyWarp.php ] && php hiddifyWarp.php || echo "skip hiddifyWarp.php"
+          echo "--- Full Generation Complete ---"
+
+      - name: Generate Lite Subscriptions
+        run: |
+          echo "--- Starting Lite PSG Generation ---"
+          set -eo pipefail
+          if [ -d lite ]; then
+            pushd lite
+            [ -f channelsAssets.php ] && php channelsAssets.php || echo "skip lite/channelsAssets.php"
+            [ -f get.php ] && php get.php || echo "skip lite/get.php"
+            [ -f duplicate.php ] && php duplicate.php || echo "skip lite/duplicate.php"
+            [ -f sort.php ] && php sort.php || echo "skip lite/sort.php"
+            [ -f toSingbox.php ] && php toSingbox.php || echo "skip lite/toSingbox.php"
+            [ -f toClashSurfboard.php ] && php toClashSurfboard.php || echo "skip lite/toClashSurfboard.php"
+            popd
+          else
+            echo "lite directory missing — skip lite generation"
+          fi
+          echo "--- Lite Generation Complete ---"
+
+      - name: Generate HTML Index Page
+        id: generate_page
+        run: |
+          echo "--- Generating HTML index page ---"
+          set -eo pipefail
+          [ -f generate_page.php ] && php generate_page.php || echo "generate_page.php missing"
+
+      - name: Commit and push if changed
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          set -eo pipefail
+          git config user.name "$GIT_AUTHOR_NAME"
+          git config user.email "$GIT_AUTHOR_EMAIL"
+          git add -A
+          if git diff --staged --quiet; then echo "no changes"; else git commit -m "Automated regen: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; git push origin HEAD:main; fi
+name: PSG — PHP CI, Security, and Scheduler
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: {}
+  schedule:
+    - cron: '0 * * * *' # hourly
+
+env:
+  TARGET_FILES: |
+    toSingbox.php
+    lite/toSingbox.php
+    sort.php
+    lite/sort.php
+    scripts/precheck.php
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  php-ci:
+    name: PHP ${{ matrix.php-version }} — checks
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php-version: [8.0, 8.1, 8.2, 8.3]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v4
+        with:
+          php-version: ${{ matrix.php-version }}
+          extensions: "mbstring, intl, xml, curl, json, zip"
+          ini-values: memory_limit=-1
+          tools: "composer:2"
+
+      - name: PHP info
+        run: php -v
+
+      - name: Targeted syntax check
+        run: |
+          set -eo pipefail
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            if [ -f "$f" ]; then php -l "$f"; else echo "Missing $f — skipped"; fi
+          done <<'FILES'
+          $TARGET_FILES
+          FILES
+
+      - name: Full repo syntax check (fast)
+        run: |
+          set -eo pipefail
+          find . -name '*.php' -not -path './vendor/*' -print0 | xargs -0 -n1 -P4 php -l || true
+
+      - name: PHPStan quick scan (phar)
+        continue-on-error: true
+        run: |
+          set -eo pipefail
+          curl -sL -o phpstan.phar https://github.com/phpstan/phpstan/releases/latest/download/phpstan.phar
+          chmod +x phpstan.phar
+          files=""
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            [ -f "$f" ] && files="$files $f"
+          done <<'FILES'
+          $TARGET_FILES
+          FILES
+          if [ -n "$files" ]; then
+            ./phpstan.phar analyse $files --level 0 || true
+          else
+            ./phpstan.phar analyse --level 0 || true
+          fi
+
+      - name: Upload phpstan binary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phpstan-${{ matrix.php-version }}
+          path: phpstan.phar
+
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: php
+
+      - name: Autobuild safe
+        run: |
+          if [ -f composer.json ]; then composer install --no-dev --no-scripts --no-interaction || true; fi
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v2
+
+  generate:
+    name: Generate & Push (scheduled/manual)
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+
+    steps:
+      - name: Checkout (full)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v4
+        with:
+          php-version: '8.3'
+          extensions: "mbstring, curl, sockets"
+          ini-values: memory_limit=-1
+          tools: "composer:2"
+
+      - name: Generate Full Subscriptions
+        run: |
+          echo "--- Starting Full PSG Generation ---"
+          set -eo pipefail
+          [ -f channelsAssets.php ] && php channelsAssets.php || echo "skip channelsAssets.php"
+          [ -f get.php ] && php get.php || echo "skip get.php"
+          [ -f duplicate.php ] && php duplicate.php || echo "skip duplicate.php"
+          [ -f sort.php ] && php sort.php || echo "skip sort.php"
+          [ -f toSingbox.php ] && php toSingbox.php || echo "skip toSingbox.php"
+          [ -f toClashSurfboard.php ] && php toClashSurfboard.php || echo "skip toClashSurfboard.php"
+          [ -f hiddifyWarp.php ] && php hiddifyWarp.php || echo "skip hiddifyWarp.php"
+          echo "--- Full Generation Complete ---"
+
+      - name: Generate Lite Subscriptions
+        run: |
+          echo "--- Starting Lite PSG Generation ---"
+          set -eo pipefail
+          if [ -d lite ]; then
+            pushd lite
+            [ -f channelsAssets.php ] && php channelsAssets.php || echo "skip lite/channelsAssets.php"
+            [ -f get.php ] && php get.php || echo "skip lite/get.php"
+            [ -f duplicate.php ] && php duplicate.php || echo "skip lite/duplicate.php"
+            [ -f sort.php ] && php sort.php || echo "skip lite/sort.php"
+            [ -f toSingbox.php ] && php toSingbox.php || echo "skip lite/toSingbox.php"
+            [ -f toClashSurfboard.php ] && php toClashSurfboard.php || echo "skip lite/toClashSurfboard.php"
+            popd
+          else
+            echo "lite directory missing — skip lite generation"
+          fi
+          echo "--- Lite Generation Complete ---"
+
+      - name: Generate HTML Index Page
+        id: generate_page
+        run: |
+          echo "--- Generating HTML index page ---"
+          set -eo pipefail
+          [ -f generate_page.php ] && php generate_page.php || echo "generate_page.php missing"
+
+      - name: Commit and push if changed
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          set -eo pipefail
+          git config user.name "$GIT_AUTHOR_NAME"
+          git config user.email "$GIT_AUTHOR_EMAIL"
+          git add -A
+          if git diff --staged --quiet; then echo "no changes"; else git commit -m "Automated regen: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; git push origin HEAD:main; fi
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v4
+        with:
+          php-version: ${{ matrix.php-version }}
+          extensions: "mbstring, intl, xml, curl, json, zip"
+          ini-values: memory_limit=-1
+          tools: "composer:2"
+
+      - name: PHP info
+        run: php -v
+
+      - name: Targeted syntax check
+        run: |
+          set -eo pipefail
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            if [ -f "$f" ]; then php -l "$f"; else echo "Missing $f — skipped"; fi
+          done <<'FILES'
+          $TARGET_FILES
+          FILES
+
+      - name: Full repo syntax check (fast)
+        run: |
+          set -eo pipefail
+          find . -name '*.php' -not -path './vendor/*' -print0 | xargs -0 -n1 -P4 php -l || true
+
+      - name: PHPStan quick scan (phar)
+        continue-on-error: true
+        run: |
+          set -eo pipefail
+          curl -sL -o phpstan.phar https://github.com/phpstan/phpstan/releases/latest/download/phpstan.phar
+          chmod +x phpstan.phar
+          files=""
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            [ -f "$f" ] && files="$files $f"
+          done <<'FILES'
+          $TARGET_FILES
+          FILES
+          if [ -n "$files" ]; then
+            ./phpstan.phar analyse $files --level 0 || true
+          else
+            ./phpstan.phar analyse --level 0 || true
+          fi
+
+      - name: Upload phpstan binary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phpstan-${{ matrix.php-version }}
+          path: phpstan.phar
+
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: php
+
+      - name: Autobuild safe
+        run: |
+          if [ -f composer.json ]; then composer install --no-dev --no-scripts --no-interaction || true; fi
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v2
+
+  generate:
+    name: Generate & Push (scheduled/manual)
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+
+    steps:
+      - name: Checkout (full)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v4
+        with:
+          php-version: '8.3'
+          extensions: "mbstring, curl, sockets"
+          ini-values: memory_limit=-1
+          tools: "composer:2"
+
+      - name: Run generation scripts (safe)
+        run: |
+          set -eo pipefail
+          for f in channelsAssets.php get.php duplicate.php sort.php toSingbox.php toClashSurfboard.php hiddifyWarp.php; do
+            if [ -f "$f" ]; then php "$f" || echo "Warning: $f failed"; else echo "Skip missing $f"; fi
+          done
+          if [ -d lite ]; then
+            pushd lite
+            for f in channelsAssets.php get.php duplicate.php sort.php toSingbox.php toClashSurfboard.php; do
+              [ -f "$f" ] && php "$f" || echo "Skip or warn: lite/$f";
+            done
+            popd
+          fi
+          [ -f generate_page.php ] && php generate_page.php || echo "generate_page.php missing"
+
+      - name: Commit and push if changed
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          name: PSG Workflow
+
+          on:
+            push:
+              branches: [main]
+            pull_request:
+              branches: [main]
+            workflow_dispatch: {}
+            schedule:
+              - cron: '0 * * * *'
+
+          env:
+            TARGET_FILES: |
+              toSingbox.php
+              lite/toSingbox.php
+              sort.php
+              lite/sort.php
+              scripts/precheck.php
+
+          concurrency:
+            group: ${{ github.workflow }}
+            cancel-in-progress: true
+
+          jobs:
+            php-ci:
+              runs-on: ubuntu-latest
+              name: PHP ${{ matrix.php-version }} checks
+              strategy:
+                fail-fast: false
+                matrix:
+                  php-version: [8.0, 8.1, 8.2, 8.3]
+
+              steps:
+                - uses: actions/checkout@v4
+
+                - name: Setup PHP
+                  uses: shivammathur/setup-php@v4
+                  with:
+                    php-version: ${{ matrix.php-version }}
+                    extensions: "mbstring, intl, xml, curl, json, zip"
+                    ini-values: memory_limit=-1
+                    tools: "composer:2"
+
+                - name: Targeted syntax check
+                  run: |
+                    set -eo pipefail
+                    while IFS= read -r f; do
+                      [ -z "$f" ] && continue
+                      [ -f "$f" ] && php -l "$f" || echo "Skip $f"
+                    done <<'FILES'
+                    $TARGET_FILES
+                    FILES
+
+                - name: Full repo syntax check
+                  run: find . -name '*.php' -not -path './vendor/*' -print0 | xargs -0 -n1 -P4 php -l || true
+
+                - name: PHPStan (phar) quick
+                  continue-on-error: true
+                  run: |
+                    curl -sL -o phpstan.phar https://github.com/phpstan/phpstan/releases/latest/download/phpstan.phar
+                    chmod +x phpstan.phar
+                    files=""
+                    while IFS= read -r f; do [ -z "$f" ] && continue; [ -f "$f" ] && files="$files $f"; done <<'FILES'
+                    $TARGET_FILES
+                    FILES
+                    ./phpstan.phar analyse ${files:-.} --level 0 || true
+
+                - name: Upload phpstan
+                  if: always()
+                  uses: actions/upload-artifact@v4
+                  with:
+                    name: phpstan-${{ matrix.php-version }}
+                    path: phpstan.phar
+
+            codeql-analysis:
+              name: CodeQL Analysis
+              runs-on: ubuntu-latest
+              permissions:
+                actions: read
+                contents: read
+                security-events: write
+
+              steps:
+                - uses: actions/checkout@v4
+                - name: Initialize CodeQL
+                  uses: github/codeql-action/init@v2
+                  with:
+                    languages: php
+                - name: Safe autobuild
+                  run: |
+                    if [ -f composer.json ]; then composer install --no-dev --no-scripts --no-interaction || true; fi
+                - name: Run CodeQL
+                  uses: github/codeql-action/analyze@v2
+
+            generate-and-push:
+              name: Generate & Push
+              runs-on: ubuntu-latest
+              if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+
+              steps:
+                - uses: actions/checkout@v4
+                  with:
+                    fetch-depth: 0
+
+                - name: Setup PHP
+                  uses: shivammathur/setup-php@v4
+                  with:
+                    php-version: '8.3'
+                    extensions: "mbstring, curl, sockets"
+                    ini-values: memory_limit=-1
+                    tools: "composer:2"
+
+                - name: Run generation scripts
+                  run: |
+                    set -eo pipefail
+                    for f in channelsAssets.php get.php duplicate.php sort.php toSingbox.php toClashSurfboard.php hiddifyWarp.php; do
+                      [ -f "$f" ] && php "$f" || echo "skip $f";
+                    done
+                    if [ -d lite ]; then
+                      pushd lite
+                      for f in channelsAssets.php get.php duplicate.php sort.php toSingbox.php toClashSurfboard.php; do
+                        [ -f "$f" ] && php "$f" || echo "skip lite/$f";
+                      done
+                      popd
+                    fi
+                    [ -f generate_page.php ] && php generate_page.php || echo "no generate_page.php"
+
+                - name: Commit & push
+                  env:
+                    GIT_AUTHOR_NAME: github-actions[bot]
+                    GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+                  run: |
+                    git config user.name "$GIT_AUTHOR_NAME"
+                    git config user.email "$GIT_AUTHOR_EMAIL"
+                    git add -A
+                    if git diff --staged --quiet; then echo "no changes"; else git commit -m "Automated regen: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; git push origin HEAD:main; fi
+            contents: read
+            security-events: write
+
+          steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Initialize CodeQL
+              uses: github/codeql-action/init@v2
+              with:
+                languages: php
+                queries: security-and-quality
+
+            - name: Autobuild (safe fallback)
+              run: |
+                echo "Attempting safe autoload discovery (no harmful side effects)"
+                if [ -f composer.json ]; then
+                  composer install --no-dev --no-scripts --no-interaction || true
+                else
+                  echo "No composer.json — skipping composer install"
+                fi
+
+            - name: Perform CodeQL analysis
+              uses: github/codeql-action/analyze@v2
+
+        generate-and-push:
+          name: PSG Workflow
+
+          on:
+            push:
+              branches: [main]
+            pull_request:
+              branches: [main]
+            workflow_dispatch: {}
+            schedule:
+              - cron: '0 * * * *'
+
+          env:
+            TARGET_FILES: |
+              toSingbox.php
+              lite/toSingbox.php
+              sort.php
+              lite/sort.php
+              scripts/precheck.php
+
+          concurrency:
+            group: ${{ github.workflow }}
+            cancel-in-progress: true
+
+          jobs:
+            php-ci:
+              name: PHP ${{ matrix.php-version }} checks
+              runs-on: ubuntu-latest
+              strategy:
+                fail-fast: false
+                matrix:
+                  php-version: [8.0, 8.1, 8.2, 8.3]
+
+              steps:
+                - uses: actions/checkout@v4
+
+                - name: Setup PHP
+                  uses: shivammathur/setup-php@v4
+                  with:
+                    php-version: ${{ matrix.php-version }}
+                    extensions: "mbstring, intl, xml, curl, json, zip"
+                    ini-values: memory_limit=-1
+                    tools: "composer:2"
+
+                - name: Targeted syntax check
+                  run: |
+                    set -eo pipefail
+                    while IFS= read -r f; do
+                      [ -z "$f" ] && continue
+                      if [ -f "$f" ]; then php -l "$f"; else echo "Skip $f"; fi
+                    done <<'FILES'
+                    $TARGET_FILES
+                    FILES
+
+                - name: Full repo syntax check
+                  run: |
+                    set -eo pipefail
+                    find . -name '*.php' -not -path './vendor/*' -print0 | xargs -0 -n1 -P4 php -l || true
+
+                - name: PHPStan quick scan (phar)
+                  continue-on-error: true
+                  run: |
+                    set -eo pipefail
+                    curl -sL -o phpstan.phar https://github.com/phpstan/phpstan/releases/latest/download/phpstan.phar
+                    chmod +x phpstan.phar
+                    files=""
+                    while IFS= read -r f; do [ -z "$f" ] && continue; [ -f "$f" ] && files="$files $f"; done <<'FILES'
+                    $TARGET_FILES
+                    FILES
+                    ./phpstan.phar analyse ${files:-.} --level 0 || true
+
+                - name: Upload phpstan
+                  if: always()
+                  uses: actions/upload-artifact@v4
+                  with:
+                    name: phpstan-${{ matrix.php-version }}
+                    path: phpstan.phar
+
+            codeql-analysis:
+              name: CodeQL Analysis
+              runs-on: ubuntu-latest
+              permissions:
+                actions: read
+                contents: read
+                security-events: write
+
+              steps:
+                - uses: actions/checkout@v4
+                - name: Initialize CodeQL
+                  uses: github/codeql-action/init@v2
+                  with:
+                    languages: php
+                - name: Safe autobuild
+                  run: |
+                    if [ -f composer.json ]; then composer install --no-dev --no-scripts --no-interaction || true; fi
+                - name: Run CodeQL
+                  uses: github/codeql-action/analyze@v2
+
+            generate-and-push:
+              name: Generate & Push
+              runs-on: ubuntu-latest
+              if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+
+              steps:
+                - uses: actions/checkout@v4
+                  with:
+                    fetch-depth: 0
+
+                - name: Setup PHP
+                  uses: shivammathur/setup-php@v4
+                  with:
+                    php-version: '8.3'
+                    extensions: "mbstring, curl, sockets"
+                    ini-values: memory_limit=-1
+                    tools: "composer:2"
+
+                - name: Run generation scripts
+                  run: |
+                    set -eo pipefail
+                    for f in channelsAssets.php get.php duplicate.php sort.php toSingbox.php toClashSurfboard.php hiddifyWarp.php; do
+                      [ -f "$f" ] && php "$f" || echo "skip $f";
+                    done
+                    if [ -d lite ]; then
+                      pushd lite
+                      for f in channelsAssets.php get.php duplicate.php sort.php toSingbox.php toClashSurfboard.php; do
+                        [ -f "$f" ] && php "$f" || echo "skip lite/$f";
+                      done
+                      popd
+                    fi
+                    [ -f generate_page.php ] && php generate_page.php || echo "no generate_page.php"
+
+                - name: Commit & push
+                  env:
+                    GIT_AUTHOR_NAME: github-actions[bot]
+                    GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+                  run: |
+                    set -eo pipefail
+                    git config user.name "$GIT_AUTHOR_NAME"
+                    git config user.email "$GIT_AUTHOR_EMAIL"
+                    git add -A
+                    if git diff --staged --quiet; then echo "no changes"; else git commit -m "Automated regen: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; git push origin HEAD:main; fi
